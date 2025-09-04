@@ -1,34 +1,98 @@
 "use client";
-import { useState } from "react";
+
+import { useEffect, useState } from "react";
 import { impliedProbAmerican, devigTwoWay, eloDelta } from "./lib";
 
 type Game = {
   id: string;
-  home: string;
-  away: string;
-  homeAmerican: number;
-  awayAmerican: number;
+  home: string;          // ESPN abbr (BUF)
+  away: string;          // ESPN abbr (NYJ)
+  // Optional odds; if absent we treat as -110/-110 (≈ 50/50)
+  homeAmerican?: number;
+  awayAmerican?: number;
 };
 
-const P0 = 20;   // display points scale
-const K  = 30;   // Elo sensitivity
+type ApiGame = {
+  id: string;
+  completed: boolean;
+  status: string;
+  home: { abbr: string; score: number };
+  away: { abbr: string; score: number };
+};
 
-const SLATE: Game[] = [
-  { id: "NFL-W01-NYJ-BUF", home: "BUF", away: "NYJ", homeAmerican: -160, awayAmerican: +140 },
-  { id: "NFL-W01-DAL-PHI", home: "PHI", away: "DAL", homeAmerican: -115, awayAmerican: -105 },
-  { id: "NFL-W01-KC-BAL",  home: "KC",  away: "BAL", homeAmerican: +110, awayAmerican: -130 },
-];
+const P0 = 20; // display-points scale
+const K = 30;  // Elo sensitivity
+
+function yyyymmdd(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}${m}${day}`;
+}
 
 export default function Home() {
-  const [picks, setPicks] = useState<Record<string, "home" | "away" | null>>(
-    Object.fromEntries(SLATE.map(g => [g.id, null]))
-  );
-  const [locked, setLocked] = useState(false);
-  const [results, setResults] = useState<Record<string, "home" | "away" | null>>({});
+  // date we’re viewing (YYYYMMDD)
+  const [date, setDate] = useState<string>(yyyymmdd());
 
+  // live slate (games you’ll pick on)
+  const [slate, setSlate] = useState<Game[]>([]);
+
+  // full board for the date (for the scoreboard list)
+  const [board, setBoard] = useState<ApiGame[]>([]);
+
+  // user picks & results
+  const [picks, setPicks] = useState<Record<string, "home" | "away" | null>>({});
+  const [results, setResults] = useState<Record<string, "home" | "away" | null>>({});
+  const [locked, setLocked] = useState(false);
+
+  // Load the day’s board + build a slate
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const r = await fetch(`/api/scoreboard/nfl?date=${date}`, { cache: "no-store" });
+        const d = await r.json();
+
+        const g: ApiGame[] = d?.games ?? [];
+        setBoard(g);
+
+        // Build your slate from today’s board.
+        // Example strategy: take non-final games (or all if none), limit to 3
+        const notFinal = g.filter(x => !x.completed);
+        const candidates = notFinal.length > 0 ? notFinal : g;
+
+        const liveSlate: Game[] = candidates
+          .slice(0, 3) // choose how many you want in the slate
+          .map(x => ({
+            id: x.id,
+            home: x.home.abbr,
+            away: x.away.abbr,
+            homeAmerican: -110,
+            awayAmerican: -110,
+          }));
+
+        setSlate(liveSlate);
+        // reset state whenever slate changes
+        setLocked(false);
+        setResults({});
+        setPicks(Object.fromEntries(liveSlate.map(gm => [gm.id, null])));
+      } catch (e) {
+        setBoard([]);
+        setSlate([]);
+        setLocked(false);
+        setResults({});
+        setPicks({});
+      }
+    };
+
+    load();
+  }, [date]);
+
+  // probability from odds (fallback 50/50)
   const calc = (g: Game) => {
-    const pHomeRaw = impliedProbAmerican(g.homeAmerican);
-    const pAwayRaw = impliedProbAmerican(g.awayAmerican);
+    const h = g.homeAmerican ?? -110;
+    const a = g.awayAmerican ?? -110;
+    const pHomeRaw = impliedProbAmerican(h);
+    const pAwayRaw = impliedProbAmerican(a);
     const { pHome, pAway } = devigTwoWay(pHomeRaw, pAwayRaw);
     return { pHome, pAway };
   };
@@ -40,20 +104,48 @@ export default function Home() {
 
   const lockPicks = () => setLocked(true);
 
-  const settle = () => {
-    // Demo: resolve winners randomly based on win% (real app will use real scores)
-    const r: Record<string, "home" | "away"> = {};
-    SLATE.forEach(g => {
-      const { pHome } = calc(g);
-      r[g.id] = Math.random() < pHome ? "home" : "away";
+  const settle = async () => {
+    if (slate.length === 0) {
+      alert("No games for this date.");
+      return;
+    }
+
+    const payload = {
+      date,
+      slate: slate.map(g => ({ id: g.id, home: g.home, away: g.away })),
+    };
+
+    const res = await fetch("/api/settle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      cache: "no-store",
     });
-    setResults(r);
+
+    const data = await res.json();
+    if (!res.ok) {
+      alert("Settle failed: " + (data?.error ?? "unknown"));
+      return;
+    }
+
+    // keep only completed games
+    const finished: Record<string, "home" | "away"> = {};
+    for (const [id, v] of Object.entries<string>(data.results ?? {})) {
+      if (v === "home" || v === "away") finished[id] = v;
+    }
+
+    if (Object.keys(finished).length === 0) {
+      alert("No FINAL games yet for this date.");
+      return;
+    }
+
+    setResults(prev => ({ ...prev, ...finished }));
   };
 
+  // totals
   let totalDisplay = 0;
   let totalElo = 0;
-
-  SLATE.forEach(g => {
+  slate.forEach(g => {
     const pick = picks[g.id];
     if (!pick) return;
     const { pHome, pAway } = calc(g);
@@ -62,47 +154,86 @@ export default function Home() {
     if (!locked || !res) return;
     const S = res === pick ? 1 : 0;
     totalDisplay += Math.round(P0 * (S - p));
-    totalElo += eloDelta(K, S as 0|1, p);
+    totalElo += eloDelta(K, S as 0 | 1, p);
   });
 
   return (
-    <main style={{padding:16, maxWidth:720, margin:"0 auto"}}>
-      <h1 style={{fontWeight:700, fontSize:22, marginBottom:12}}>RightCall — Demo Slate</h1>
+    <main style={{ padding: 16, maxWidth: 820, margin: "0 auto" }}>
+      <h1 style={{ fontWeight: 700, fontSize: 22, marginBottom: 12 }}>
+        RightCall — Live Slate
+      </h1>
 
-      {SLATE.map(g => {
+      {/* Date picker */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+        <label style={{ fontSize: 14, opacity: 0.9 }}>Date:</label>
+        <input
+          type="date"
+          value={`${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`}
+          onChange={(e) => setDate(e.currentTarget.value.replaceAll("-", ""))}
+          style={{ background: "#111", color: "#fff", borderRadius: 6, padding: "6px 8px", border: "1px solid #444" }}
+        />
+        <div style={{ fontSize: 12, opacity: 0.7 }}>
+          (changes reload real matchups)
+        </div>
+      </div>
+
+      {/* Slate cards */}
+      {slate.length === 0 && (
+        <div style={{ marginBottom: 12, fontSize: 14, opacity: 0.8 }}>
+          No games found for this date.
+        </div>
+      )}
+
+      {slate.map(g => {
         const { pHome, pAway } = calc(g);
         const homeRW = rightWrong(pHome);
         const awayRW = rightWrong(pAway);
         const userPick = picks[g.id];
 
         return (
-          <div key={g.id} style={{border:"1px solid #ddd", borderRadius:8, padding:12, marginBottom:10}}>
-            <div style={{fontWeight:600, marginBottom:8}}>{g.away} @ {g.home}</div>
+          <div key={g.id} style={{ border: "1px solid #333", borderRadius: 8, padding: 12, marginBottom: 10 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>
+              {g.away} @ {g.home}
+            </div>
 
-            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:8}}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
               <button
                 disabled={locked}
                 onClick={() => setPicks(prev => ({ ...prev, [g.id]: "home" }))}
-                style={{border:"1px solid #aaa", borderRadius:8, padding:10, textAlign:"left", background:userPick==="home"?"#111":"#fff", color:userPick==="home"?"#fff":"#111"}}
+                style={{
+                  border: "1px solid #555",
+                  borderRadius: 8,
+                  padding: 10,
+                  textAlign: "left",
+                  background: userPick === "home" ? "#111" : "#fff",
+                  color: userPick === "home" ? "#fff" : "#111"
+                }}
               >
-                <div style={{fontSize:12}}>Pick {g.home}</div>
-                <div style={{fontSize:12, opacity:.7}}>Win% {Math.round(pHome*100)}%</div>
-                <div style={{fontSize:13}}>Right: +{homeRW.right} · Wrong: {homeRW.wrong}</div>
+                <div style={{ fontSize: 12 }}>Pick {g.home}</div>
+                <div style={{ fontSize: 12, opacity: .7 }}>Win% {Math.round(pHome * 100)}%</div>
+                <div style={{ fontSize: 13 }}>Right: +{homeRW.right} · Wrong: {homeRW.wrong}</div>
               </button>
 
               <button
                 disabled={locked}
                 onClick={() => setPicks(prev => ({ ...prev, [g.id]: "away" }))}
-                style={{border:"1px solid #aaa", borderRadius:8, padding:10, textAlign:"left", background:userPick==="away"?"#111":"#fff", color:userPick==="away"?"#fff":"#111"}}
+                style={{
+                  border: "1px solid #555",
+                  borderRadius: 8,
+                  padding: 10,
+                  textAlign: "left",
+                  background: userPick === "away" ? "#111" : "#fff",
+                  color: userPick === "away" ? "#fff" : "#111"
+                }}
               >
-                <div style={{fontSize:12}}>Pick {g.away}</div>
-                <div style={{fontSize:12, opacity:.7}}>Win% {Math.round(pAway*100)}%</div>
-                <div style={{fontSize:13}}>Right: +{awayRW.right} · Wrong: {awayRW.wrong}</div>
+                <div style={{ fontSize: 12 }}>Pick {g.away}</div>
+                <div style={{ fontSize: 12, opacity: .7 }}>Win% {Math.round(pAway * 100)}%</div>
+                <div style={{ fontSize: 13 }}>Right: +{awayRW.right} · Wrong: {awayRW.wrong}</div>
               </button>
             </div>
 
             {locked && results[g.id] && (
-              <div style={{marginTop:8, fontSize:13}}>
+              <div style={{ marginTop: 8, fontSize: 13 }}>
                 Result: <b>{results[g.id]}</b> won · Your pick: <b>{picks[g.id] ?? "-"}</b>
               </div>
             )}
@@ -110,22 +241,40 @@ export default function Home() {
         );
       })}
 
-      <div style={{display:"flex", gap:8, marginTop:12}}>
-        <button onClick={lockPicks} disabled={locked} style={{padding:"8px 12px", border:"1px solid #aaa", borderRadius:8}}>
+      <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <button onClick={() => setLocked(true)} disabled={locked || slate.length === 0}
+          style={{ padding: "8px 12px", border: "1px solid #555", borderRadius: 8 }}>
           {locked ? "Locked" : "Lock my picks"}
         </button>
-        <button onClick={settle} disabled={!locked} style={{padding:"8px 12px", border:"1px solid #aaa", borderRadius:8}}>
-          Settle (demo)
+        <button onClick={settle} disabled={!locked}
+          style={{ padding: "8px 12px", border: "1px solid #555", borderRadius: 8 }}>
+          Settle
         </button>
       </div>
 
-      {locked && Object.keys(results).length === SLATE.length && (
-        <div style={{marginTop:16, padding:12, background:"#f8f8f8", border:"1px solid #eee", borderRadius:8}}>
-          <div style={{fontWeight:600, marginBottom:4}}>Summary</div>
+      {locked && Object.keys(results).length > 0 && (
+        <div style={{ marginTop: 16, padding: 12, background: "#0f0f0f", border: "1px solid #222", borderRadius: 8 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Summary</div>
           <div>Display points total: <b>{totalDisplay >= 0 ? `+${totalDisplay}` : totalDisplay}</b></div>
-          <div>Elo change (K=30): <b>{totalElo >= 0 ? `+${totalElo}` : totalElo}</b></div>
+          <div>Elo change (K=30): <b>{Math.round(totalElo * 1000) / 1000 >= 0 ? `+${Math.round(totalElo * 1000) / 1000}` : Math.round(totalElo * 1000) / 1000}</b></div>
         </div>
       )}
+
+      {/* Live scoreboard for the date */}
+      <section style={{ marginTop: 24 }}>
+        <h3 style={{ fontWeight: 600, marginBottom: 8 }}>Scoreboard — {date}</h3>
+        {board.length === 0 ? (
+          <div style={{ fontSize: 13, opacity: 0.8 }}>No games.</div>
+        ) : (
+          <ul style={{ listStyle: "none", padding: 0, margin: 0, fontSize: 14 }}>
+            {board.map(g => (
+              <li key={g.id} style={{ marginBottom: 4 }}>
+                {g.away.abbr} {g.away.score} @ {g.home.abbr} {g.home.score} · {g.completed ? "FINAL" : g.status}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </main>
   );
 }
