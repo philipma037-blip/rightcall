@@ -22,22 +22,28 @@ type OutGame = {
   away: OutTeam;
 };
 
-function yyyymmdd(d = new Date()) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}${m}${day}`;
-}
-
 function toNumber(v: unknown): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 }
 
-async function fetchEspnNFL(date?: string): Promise<OutGame[] | { ok: false; status: number }> {
+function qsForWeek(year: number, week: number, seasontype: number) {
+  const p = new URLSearchParams();
+  p.set("year", String(year));
+  p.set("week", String(week));
+  p.set("seasontype", String(seasontype)); // 1=pre, 2=reg, 3=post
+  return `?${p.toString()}`;
+}
+
+/** Fetch scoreboard by week (preferred) */
+async function fetchEspnNFLByWeek(
+  year: number,
+  week: number,
+  seasontype: number
+): Promise<OutGame[] | { ok: false; status: number }> {
   const base1 = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
   const base2 = "https://site.api.espn.com/apis/v2/sports/football/nfl/scoreboard";
-  const qs = date ? `?dates=${date}` : "";
+  const qs = qsForWeek(year, week, seasontype);
   const headers = { "User-Agent": "Mozilla/5.0 (RightCall MVP)" };
 
   let res = await fetch(`${base1}${qs}`, { headers, cache: "no-store" });
@@ -74,11 +80,13 @@ async function fetchEspnNFL(date?: string): Promise<OutGame[] | { ok: false; sta
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const date = url.searchParams.get("date") || yyyymmdd();
-  const out = await fetchEspnNFL(date);
+  const year = Number(url.searchParams.get("year") ?? new Date().getFullYear());
+  const week = Number(url.searchParams.get("week") ?? 1);
+  const seasontype = Number(url.searchParams.get("seasontype") ?? 2); // 2 = Regular
 
+  const out = await fetchEspnNFLByWeek(year, week, seasontype);
   if (Array.isArray(out)) {
-    return NextResponse.json({ date, games: out });
+    return NextResponse.json({ year, week, seasontype, games: out });
   }
   return NextResponse.json({ error: `upstream status ${out.status}` }, { status: 502 });
 }

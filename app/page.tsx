@@ -1,40 +1,71 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { impliedProbAmerican, devigTwoWay, eloDelta } from "./lib";
 
-type Game = { id: string; home: string; away: string; homeAmerican?: number; awayAmerican?: number };
-type ApiGame = { id: string; completed: boolean; status: string; home: { abbr: string; score: number }; away: { abbr: string; score: number } };
+type Game = {
+  id: string;
+  home: string;
+  away: string;
+  homeAmerican?: number;
+  awayAmerican?: number;
+};
+
+type ApiGame = {
+  id: string;
+  completed: boolean;
+  status: string;
+  home: { abbr: string; score: number };
+  away: { abbr: string; score: number };
+};
 
 const P0 = 20;
 const K = 30;
 
-function yyyymmdd(d = new Date()) {
-  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0");
-  return `${y}${m}${day}`;
-}
+const CURRENT_YEAR = new Date().getFullYear();
+// sensible defaults: Regular season (2), Week 1
+const DEFAULT_SEASON_TYPE = 2;
+const DEFAULT_WEEK = 1;
 
 export default function Home() {
-  const [date, setDate] = useState<string>(yyyymmdd());
-  const [slate, setSlate] = useState<Game[]>([]);
+  const [year, setYear] = useState<number>(CURRENT_YEAR);
+  const [week, setWeek] = useState<number>(DEFAULT_WEEK);
+  const [seasontype, setSeasontype] = useState<number>(DEFAULT_SEASON_TYPE);
+
   const [board, setBoard] = useState<ApiGame[]>([]);
+  const [slate, setSlate] = useState<Game[]>([]);
   const [picks, setPicks] = useState<Record<string, "home" | "away" | null>>({});
   const [results, setResults] = useState<Record<string, "home" | "away" | null>>({});
   const [locked, setLocked] = useState(false);
 
+  // range for weeks shown in selector (pre 3, reg 18, post ~5)
+  const maxWeeks = useMemo(() => {
+    if (seasontype === 1) return 3;
+    if (seasontype === 3) return 5;
+    return 18;
+  }, [seasontype]);
+
   useEffect(() => {
     const load = async () => {
       try {
-        const r = await fetch(`/api/scoreboard/nfl?date=${date}`, { cache: "no-store" });
+        const params = new URLSearchParams({
+          year: String(year),
+          week: String(week),
+          seasontype: String(seasontype),
+        });
+        const r = await fetch(`/api/scoreboard/nfl?${params.toString()}`, { cache: "no-store" });
         const d = await r.json();
         const g: ApiGame[] = d?.games ?? [];
         setBoard(g);
 
-        const notFinal = g.filter(x => !x.completed);
-        const candidates = notFinal.length > 0 ? notFinal : g;
-
-        const liveSlate: Game[] = candidates.slice(0, 3).map(x => ({
-          id: x.id, home: x.home.abbr, away: x.away.abbr, homeAmerican: -110, awayAmerican: -110
+        // For a weekly slate, we just include ALL games returned
+        const liveSlate: Game[] = g.map(x => ({
+          id: x.id,
+          home: x.home.abbr,
+          away: x.away.abbr,
+          // You can wire real odds later; default 50/50-ish lines:
+          homeAmerican: -110,
+          awayAmerican: -110,
         }));
 
         setSlate(liveSlate);
@@ -42,14 +73,19 @@ export default function Home() {
         setResults({});
         setPicks(Object.fromEntries(liveSlate.map(gm => [gm.id, null])));
       } catch {
-        setBoard([]); setSlate([]); setLocked(false); setResults({}); setPicks({});
+        setBoard([]);
+        setSlate([]);
+        setLocked(false);
+        setResults({});
+        setPicks({});
       }
     };
     load();
-  }, [date]);
+  }, [year, week, seasontype]);
 
   const calc = (g: Game) => {
-    const h = g.homeAmerican ?? -110, a = g.awayAmerican ?? -110;
+    const h = g.homeAmerican ?? -110;
+    const a = g.awayAmerican ?? -110;
     const pHomeRaw = impliedProbAmerican(h);
     const pAwayRaw = impliedProbAmerican(a);
     const { pHome, pAway } = devigTwoWay(pHomeRaw, pAwayRaw);
@@ -60,15 +96,36 @@ export default function Home() {
   const lockPicks = () => setLocked(true);
 
   const settle = async () => {
-    if (slate.length === 0) { alert("No games for this date."); return; }
-    const payload = { date, slate: slate.map(g => ({ id: g.id, home: g.home, away: g.away })) };
-    const res = await fetch("/api/settle", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), cache: "no-store" });
+    if (slate.length === 0) {
+      alert("No games for this week.");
+      return;
+    }
+    const payload = {
+      year,
+      week,
+      seasontype,
+      slate: slate.map(g => ({ id: g.id, home: g.home, away: g.away })),
+    };
+    const res = await fetch("/api/settle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    });
     const data = await res.json();
-    if (!res.ok) { alert("Settle failed: " + (data?.error ?? "unknown")); return; }
+    if (!res.ok) {
+      alert("Settle failed: " + (data?.error ?? "unknown"));
+      return;
+    }
 
     const finished: Record<string, "home" | "away"> = {};
-    for (const [id, v] of Object.entries<string>(data.results ?? {})) if (v === "home" || v === "away") finished[id] = v;
-    if (Object.keys(finished).length === 0) { alert("No FINAL games yet for this date."); return; }
+    for (const [id, v] of Object.entries<string>(data.results ?? {})) {
+      if (v === "home" || v === "away") finished[id] = v;
+    }
+    if (Object.keys(finished).length === 0) {
+      alert("No FINAL games yet for this week.");
+      return;
+    }
     setResults(prev => ({ ...prev, ...finished }));
   };
 
@@ -84,21 +141,48 @@ export default function Home() {
   });
 
   return (
-    <main style={{ padding: 16, maxWidth: 820, margin: "0 auto" }}>
-      <h1 style={{ fontWeight: 700, fontSize: 22, marginBottom: 12 }}>RightCall — Live Slate</h1>
+    <main style={{ padding: 16, maxWidth: 900, margin: "0 auto" }}>
+      <h1 style={{ fontWeight: 700, fontSize: 22, marginBottom: 12 }}>
+        RightCall — NFL Week Slate
+      </h1>
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
-        <label style={{ fontSize: 14, opacity: 0.9 }}>Date:</label>
+      {/* Week controls */}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+        <label>Year</label>
         <input
-          type="date"
-          value={`${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)}`}
-          onChange={(e) => setDate(e.currentTarget.value.replaceAll("-", ""))}
-          style={{ background: "#111", color: "#fff", borderRadius: 6, padding: "6px 8px", border: "1px solid #444" }}
+          type="number"
+          min={2005}
+          max={year + 1}
+          value={year}
+          onChange={(e) => setYear(Number(e.currentTarget.value))}
+          style={{ width: 90, background: "#111", color: "#fff", borderRadius: 6, padding: "6px 8px", border: "1px solid #444" }}
         />
-        <div style={{ fontSize: 12, opacity: 0.7 }}>(changes reload real matchups)</div>
+
+        <label>Season</label>
+        <select
+          value={seasontype}
+          onChange={(e) => { setSeasontype(Number(e.currentTarget.value)); setWeek(1); }}
+          style={{ background: "#111", color: "#fff", borderRadius: 6, padding: "6px 8px", border: "1px solid #444" }}
+        >
+          <option value={1}>Preseason</option>
+          <option value={2}>Regular</option>
+          <option value={3}>Postseason</option>
+        </select>
+
+        <label>Week</label>
+        <select
+          value={week}
+          onChange={(e) => setWeek(Number(e.currentTarget.value))}
+          style={{ background: "#111", color: "#fff", borderRadius: 6, padding: "6px 8px", border: "1px solid #444" }}
+        >
+          {Array.from({ length: maxWeeks }, (_, i) => i + 1).map(w => (
+            <option key={w} value={w}>Week {w}</option>
+          ))}
+        </select>
       </div>
 
-      {slate.length === 0 && <div style={{ marginBottom: 12, fontSize: 14, opacity: 0.8 }}>No games found for this date.</div>}
+      {/* Slate (all games that week) */}
+      {slate.length === 0 && <div style={{ marginBottom: 12, fontSize: 14, opacity: 0.8 }}>No games found.</div>}
 
       {slate.map(g => {
         const { pHome, pAway } = calc(g);
@@ -108,18 +192,34 @@ export default function Home() {
 
         return (
           <div key={g.id} style={{ border: "1px solid #333", borderRadius: 8, padding: 12, marginBottom: 10 }}>
-            <div style={{ fontWeight: 600, marginBottom: 8 }}>{g.away} @ {g.home}</div>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>
+              {g.away} @ {g.home}
+            </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <button disabled={locked} onClick={() => setPicks(prev => ({ ...prev, [g.id]: "home" }))}
-                style={{ border: "1px solid #555", borderRadius: 8, padding: 10, textAlign: "left", background: userPick === "home" ? "#111" : "#fff", color: userPick === "home" ? "#fff" : "#111" }}>
+              <button
+                disabled={locked}
+                onClick={() => setPicks(prev => ({ ...prev, [g.id]: "home" }))}
+                style={{
+                  border: "1px solid #555", borderRadius: 8, padding: 10,
+                  textAlign: "left", background: userPick === "home" ? "#111" : "#fff",
+                  color: userPick === "home" ? "#fff" : "#111"
+                }}
+              >
                 <div style={{ fontSize: 12 }}>Pick {g.home}</div>
                 <div style={{ fontSize: 12, opacity: .7 }}>Win% {Math.round(pHome * 100)}%</div>
                 <div style={{ fontSize: 13 }}>Right: +{homeRW.right} · Wrong: {homeRW.wrong}</div>
               </button>
 
-              <button disabled={locked} onClick={() => setPicks(prev => ({ ...prev, [g.id]: "away" }))}
-                style={{ border: "1px solid #555", borderRadius: 8, padding: 10, textAlign: "left", background: userPick === "away" ? "#111" : "#fff", color: userPick === "away" ? "#fff" : "#111" }}>
+              <button
+                disabled={locked}
+                onClick={() => setPicks(prev => ({ ...prev, [g.id]: "away" }))}
+                style={{
+                  border: "1px solid #555", borderRadius: 8, padding: 10,
+                  textAlign: "left", background: userPick === "away" ? "#111" : "#fff",
+                  color: userPick === "away" ? "#fff" : "#111"
+                }}
+              >
                 <div style={{ fontSize: 12 }}>Pick {g.away}</div>
                 <div style={{ fontSize: 12, opacity: .7 }}>Win% {Math.round(pAway * 100)}%</div>
                 <div style={{ fontSize: 13 }}>Right: +{awayRW.right} · Wrong: {awayRW.wrong}</div>
@@ -146,16 +246,11 @@ export default function Home() {
         </button>
       </div>
 
-      {locked && Object.keys(results).length > 0 && (
-        <div style={{ marginTop: 16, padding: 12, background: "#0f0f0f", border: "1px solid #222", borderRadius: 8 }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>Summary</div>
-          <div>Display points total: <b>{totalDisplay >= 0 ? `+${totalDisplay}` : totalDisplay}</b></div>
-          <div>Elo change (K=30): <b>{Math.round(totalElo * 1000) / 1000 >= 0 ? `+${Math.round(totalElo * 1000) / 1000}` : Math.round(totalElo * 1000) / 1000}</b></div>
-        </div>
-      )}
-
+      {/* Simple scoreboard */}
       <section style={{ marginTop: 24 }}>
-        <h3 style={{ fontWeight: 600, marginBottom: 8 }}>Scoreboard — {date}</h3>
+        <h3 style={{ fontWeight: 600, marginBottom: 8 }}>
+          Scoreboard — {year} · {seasontype === 1 ? "Pre" : seasontype === 2 ? "Regular" : "Post"} Week {week}
+        </h3>
         {board.length === 0 ? (
           <div style={{ fontSize: 13, opacity: 0.8 }}>No games.</div>
         ) : (
@@ -168,6 +263,18 @@ export default function Home() {
           </ul>
         )}
       </section>
+
+      {/* Summary */}
+      {locked && Object.keys(results).length > 0 && (
+        <div style={{ marginTop: 16, padding: 12, background: "#0f0f0f", border: "1px solid #222", borderRadius: 8 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Summary</div>
+          <div>Display points total: <b>{totalDisplay >= 0 ? `+${totalDisplay}` : totalDisplay}</b></div>
+          <div>
+            Elo change (K=30):{" "}
+            <b>{(Math.round(totalElo * 1000) / 1000 >= 0 ? "+" : "") + (Math.round(totalElo * 1000) / 1000)}</b>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
