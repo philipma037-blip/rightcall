@@ -46,42 +46,58 @@ export default function Home() {
   }, [seasontype]);
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        const params = new URLSearchParams({
-          year: String(year),
-          week: String(week),
-          seasontype: String(seasontype),
-        });
-        const r = await fetch(`/api/scoreboard/nfl?${params.toString()}`, { cache: "no-store" });
-        const d = await r.json();
-        const g: ApiGame[] = d?.games ?? [];
-        setBoard(g);
+  const load = async () => {
+    try {
+      // 1) Weekly scoreboard
+      const params = new URLSearchParams({
+        year: String(year),
+        week: String(week),
+        seasontype: String(seasontype),
+      });
+      const r = await fetch(`/api/scoreboard/nfl?${params.toString()}`, { cache: "no-store" });
+      const d = await r.json();
+      const g: ApiGame[] = d?.games ?? [];
+      setBoard(g);
 
-        // For a weekly slate, we just include ALL games returned
-        const liveSlate: Game[] = g.map(x => ({
-          id: x.id,
-          home: x.home.abbr,
-          away: x.away.abbr,
-          // You can wire real odds later; default 50/50-ish lines:
-          homeAmerican: -110,
-          awayAmerican: -110,
-        }));
+      // 2) Convert to slate (all week’s games)
+      let liveSlate: Game[] = g.map((x) => ({
+        id: x.id,
+        home: x.home.abbr,
+        away: x.away.abbr,
+        homeAmerican: -110,
+        awayAmerican: -110,
+      }));
 
-        setSlate(liveSlate);
-        setLocked(false);
-        setResults({});
-        setPicks(Object.fromEntries(liveSlate.map(gm => [gm.id, null])));
-      } catch {
-        setBoard([]);
-        setSlate([]);
-        setLocked(false);
-        setResults({});
-        setPicks({});
+      // 3) Fetch odds & merge
+      const ro = await fetch(`/api/odds/nfl`, { cache: "no-store" });
+      if (ro.ok) {
+        const { odds } = (await ro.json()) as {
+          odds?: Record<string, { homeAmerican: number; awayAmerican: number }>;
+        };
+        if (odds) {
+          liveSlate = liveSlate.map((gm) => {
+            const key = `${gm.away}@${gm.home}`;
+            const o = odds[key];
+            return o ? { ...gm, homeAmerican: o.homeAmerican, awayAmerican: o.awayAmerican } : gm;
+          });
+        }
       }
-    };
-    load();
-  }, [year, week, seasontype]);
+
+      setSlate(liveSlate);
+      setLocked(false);
+      setResults({});
+      setPicks(Object.fromEntries(liveSlate.map((gm) => [gm.id, null])));
+    } catch {
+      setBoard([]);
+      setSlate([]);
+      setLocked(false);
+      setResults({});
+      setPicks({});
+    }
+  };
+  load();
+}, [year, week, seasontype]);
+
 
   const calc = (g: Game) => {
     const h = g.homeAmerican ?? -110;
